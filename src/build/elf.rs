@@ -2150,6 +2150,31 @@ impl<'data> Builder<'data> {
             _ => None,
         }
     }
+
+    /// Find the segment containing the stack exect.
+    ///
+    /// This uses the `PT_GNU_STACK` program header to find the executable.
+    pub fn gnu_stack_mut(&mut self) -> Option<&mut Segment<'data>> {
+        let segment = self
+            .segments
+            .iter_mut()
+            .find(|segment| segment.p_type == elf::PT_GNU_STACK)?;
+
+        Some(segment)
+    }
+
+    /// Add a new `PT_GNU_STACK` segment
+    /// with all segment permision
+    pub fn add_gnu_stack(&mut self) -> &mut Segment<'data> {
+        // add a new program header entry
+        let segment = self.segments.add();
+        segment.p_type = elf::PT_GNU_STACK;
+        // set elf::PF_X  to 0 as we are clearing the executable stack
+        segment.p_flags = elf::PF_R | elf::PF_W | elf::PF_X;
+        segment.p_align = 0x10;
+
+        segment
+    }
 }
 
 /// ELF file header.

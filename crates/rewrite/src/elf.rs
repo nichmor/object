@@ -1,8 +1,16 @@
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    fs,
+    path::Path,
+};
 
 #[cfg(feature = "logging")]
 use log::info;
-use object::{build, elf};
+use object::read::elf::FileHeader;
+use object::{
+    build::{self, elf::VersionId, ByteString},
+    elf,
+};
 
 use super::{Error, Result, Rewriter};
 
@@ -551,6 +559,211 @@ impl Rewriter<'_> {
         }
         *data = interpreter.into();
         self.modified = true;
+        Ok(())
+    }
+
+    /// Set the EI_OSABI to some ABI
+    pub fn elf_set_osabi(&mut self, abi_name: &str) -> Result<()> {
+        let header = &mut self.builder.header;
+
+        // lowercase the name
+        let abi_name = abi_name.to_lowercase();
+
+        let new_abi = match abi_name.as_str() {
+            "sysv" => elf::ELFOSABI_SYSV,
+            "hpux" => elf::ELFOSABI_HPUX,
+            "netbsd" => elf::ELFOSABI_NETBSD,
+            "linux" => elf::ELFOSABI_LINUX,
+            "hurd" | "gnu-hurd" | "gnu hurd" => elf::ELFOSABI_HURD,
+            "solaris" => elf::ELFOSABI_SOLARIS,
+            "aix" => elf::ELFOSABI_AIX,
+            "irix" => elf::ELFOSABI_IRIX,
+            "freebsd" => elf::ELFOSABI_FREEBSD,
+            "tru64" => elf::ELFOSABI_TRU64,
+            "modesto" => elf::ELFOSABI_MODESTO,
+            "openbsd" => elf::ELFOSABI_OPENBSD,
+            "openvms" => elf::ELFOSABI_OPENVMS,
+            "nsk" => elf::ELFOSABI_NSK,
+            "aros" => elf::ELFOSABI_AROS,
+            "fenixos" => elf::ELFOSABI_FENIXOS,
+            "cloudabi" => elf::ELFOSABI_CLOUDABI,
+            _ => return Err(Error::modify(format!("Unknown ABI {abi_name}"))),
+        };
+
+        header.os_abi = new_abi;
+
+        self.modified = true;
+        Ok(())
+    }
+
+    /// Remove from the DT_RUNPATH or DT_RPATH all directories that do not contain a library referenced by DT_NEEDED.
+    pub fn elf_shrink_rpath(&mut self, allowed_rpath_prefixes: Vec<String>) -> Result<()> {
+        let endian = self.builder.endian.clone();
+        let e_machine = self.builder.header.e_machine;
+        let needed_libraries = self
+            .elf_needed()
+            .map(|e| e.to_vec())
+            .collect::<HashSet<_>>();
+        let dynamic = self
+            .builder
+            .dynamic_data_mut()
+            .ok_or_else(|| Error::modify("No dynamic section found; can't shrink rpath"))?;
+        let mut found = false;
+        for entry in dynamic.iter_mut() {
+            let build::elf::Dynamic::String { tag, val } = entry else {
+                continue;
+            };
+            if *tag != elf::DT_RPATH && *tag != elf::DT_RUNPATH {
+                continue;
+            }
+
+            found = true;
+
+            let rpath = val.clone();
+            let rpath_str = rpath.to_string();
+            let mut rpath_vec: Vec<&str> = rpath_str.split(":").collect();
+            // rpath_vec.retain(|&x| x != "");
+
+            // Check if each directory contains a library referenced by DT_NEEDED
+            rpath_vec.retain(|&dir| {
+                let dir_path = Path::new(dir);
+
+                // Keep non-absolute paths (e.g., "$ORIGIN")
+                if !dir.starts_with('/') {
+                    return true;
+                };
+
+                // Check allowed prefixes
+                if !allowed_rpath_prefixes.is_empty()
+                    && !allowed_rpath_prefixes
+                        .iter()
+                        .any(|prefix| dir.starts_with(prefix))
+                {
+                    eprintln!("Removing {} from RPATH due to non-allowed prefix", dir);
+                    return false;
+                }
+
+                for lib_needed in needed_libraries.iter() {
+                    let possible_library = String::from_utf8(lib_needed.to_vec()).unwrap();
+
+                    let library_location = dir_path.join(possible_library);
+                    // read the elf file
+                    let file_content = fs::read(library_location);
+                    let Ok(file_content) = file_content else {
+                        continue;
+                    };
+                    let elf_file =
+                        elf::FileHeader64::<object::Endianness>::parse(file_content.as_slice())
+                            .unwrap();
+                    let lib_e_machine = elf_file.e_machine(endian);
+
+                    if lib_e_machine == e_machine {
+                        return true;
+                    }
+                }
+                eprintln!("Removing directory {}", dir);
+                false
+            });
+
+            eprintln!("New rpath: {:?}", rpath_vec);
+
+            let new_rpath = rpath_vec.join(":");
+            *val.to_mut() = ByteString::from(new_rpath.as_bytes()).to_vec();
+
+            #[cfg(feature = "logging")]
+            info!("Shrinking DT_RPATH to {}", rpath);
+        }
+        if !found {
+            return Err(Error::modify("No DT_RPATH entry found"));
+        }
+        self.modified = true;
+        Ok(())
+    }
+
+    /// Disable the default library search paths
+    pub fn elf_no_default_lib(&mut self) -> Result<()> {
+        let dynamic = self
+            .builder
+            .dynamic_data_mut()
+            .ok_or_else(|| Error::modify("No dynamic section found; can't set soname"))?;
+        let mut found = false;
+        for entry in dynamic.iter_mut() {
+            let build::elf::Dynamic::Integer { tag, val } = entry else {
+                continue;
+            };
+            if *tag != elf::DT_FLAGS_1 {
+                continue;
+            }
+
+            *val |= elf::DF_1_NODEFLIB as u64;
+            #[cfg(feature = "logging")]
+            info!("Setting DT_FLAGS_1 to DF_1_NODEFLIB");
+            found = true;
+        }
+        if !found {
+            #[cfg(feature = "logging")]
+            info!("Adding DT_FLAGS_1 entry with DF_1_NODEFLIB");
+            dynamic.push(build::elf::Dynamic::Integer {
+                tag: elf::DT_FLAGS_1,
+                val: elf::DF_1_NODEFLIB as u64,
+            });
+        }
+        self.modified = true;
+        Ok(())
+    }
+
+    /// Clear the symbol version information for a symbol
+    pub fn elf_clear_symbol_version(&mut self, symbol: &str) -> Result<()> {
+        let symbols = &mut self.builder.dynamic_symbols;
+
+        let mut found = false;
+        for entry in symbols.iter_mut() {
+            // verify if the symbol is the one we are looking for
+            if entry.name == symbol.into() {
+                // clear the version
+                entry.version = VersionId::global();
+                found = true;
+            }
+        }
+        if found {
+            self.modified = true;
+        }
+        Ok(())
+    }
+
+    /// Clear the symbol version information for a symbol
+    pub fn elf_clear_exec_stack(&mut self) -> Result<()> {
+        let gnu_stack = self.builder.gnu_stack_mut();
+
+        let gnu_stack = if let Some(segment) = gnu_stack {
+            segment
+        } else {
+            // add a new PT_GNU_STACK segment
+            self.builder.add_gnu_stack()
+        };
+
+        gnu_stack.p_flags &= !elf::PF_X;
+
+        self.modified = true;
+
+        Ok(())
+    }
+
+    /// Clear the symbol version information for a symbol
+    pub fn elf_set_exec_stack(&mut self) -> Result<()> {
+        let gnu_stack = self.builder.gnu_stack_mut();
+
+        let gnu_stack = if let Some(segment) = gnu_stack {
+            segment
+        } else {
+            // add a new PT_GNU_STACK segment
+            self.builder.add_gnu_stack()
+        };
+
+        gnu_stack.p_flags |= elf::PF_X;
+
+        self.modified = true;
+
         Ok(())
     }
 
