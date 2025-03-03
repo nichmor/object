@@ -6,7 +6,7 @@ use std::{
 
 #[cfg(feature = "logging")]
 use log::info;
-use object::read::elf::FileHeader;
+use object::{build::elf::Header, read::elf::FileHeader};
 use object::{
     build::{self, elf::VersionId, ByteString},
     elf,
@@ -765,6 +765,20 @@ impl Rewriter<'_> {
         self.modified = true;
 
         Ok(())
+    }
+
+    /// Return the flags of the PT_GNU_STACK segment
+    pub fn elf_gnu_exec_stack(&self) -> Option<u32> {
+        let gnu_stack = self.builder.gnu_stack();
+        if let Some(segment) = gnu_stack {
+            return Some(segment.p_flags);
+        }
+        None
+    }
+
+    /// Return the ELF file header
+    pub fn header(&self) -> &Header {
+        &self.builder.header
     }
 
     pub(crate) fn elf_finalize(&mut self) -> Result<()> {

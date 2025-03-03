@@ -2151,13 +2151,25 @@ impl<'data> Builder<'data> {
         }
     }
 
-    /// Find the segment containing the stack exect.
+    /// Find and return the mutable reference to the segment containing the stack exec.
     ///
     /// This uses the `PT_GNU_STACK` program header to find the executable.
     pub fn gnu_stack_mut(&mut self) -> Option<&mut Segment<'data>> {
         let segment = self
             .segments
             .iter_mut()
+            .find(|segment| segment.p_type == elf::PT_GNU_STACK)?;
+
+        Some(segment)
+    }
+
+    /// Find the segment containing the stack exect.
+    ///
+    /// This uses the `PT_GNU_STACK` program header to find the executable.
+    pub fn gnu_stack(&self) -> Option<&Segment<'data>> {
+        let segment = self
+            .segments
+            .iter()
             .find(|segment| segment.p_type == elf::PT_GNU_STACK)?;
 
         Some(segment)
